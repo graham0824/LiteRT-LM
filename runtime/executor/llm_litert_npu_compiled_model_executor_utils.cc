@@ -1080,6 +1080,37 @@ void DequantizeInt8Row(const int8_t* packed_data, float scale, int col_size,
     output[i] = static_cast<float>(packed_data[i]) * scale;
   }
 }
+
+// Int2: 4 values packed per byte, 2 bits each, signed (-2..1).
+// Bit layout within a byte (MSB first): [v3|v2|v1|v0]
+void UnpackInt2Row(const uint8_t* packed_data, float scale, int col_size,
+                   float* output) {
+  float scale0 = scale / 4.0f;  // 2-bit signed: divide by 2^(2-1) = 2... but
+                                 // sign-extend via <<6 then >>6 gives /64*scale
+  int j = 0;
+  int idx = 0;
+  for (; j < col_size - 3; j += 4, ++idx) {
+    uint8_t b = packed_data[idx];
+    // Sign-extend each 2-bit value via shift tricks
+    int8_t v0 = static_cast<int8_t>((b << 6)) >> 6;
+    int8_t v1 = static_cast<int8_t>((b << 4)) >> 6;
+    int8_t v2 = static_cast<int8_t>((b << 2)) >> 6;
+    int8_t v3 = static_cast<int8_t>(b)        >> 6;
+    output[j]     = static_cast<float>(v0) * scale0;
+    output[j + 1] = static_cast<float>(v1) * scale0;
+    output[j + 2] = static_cast<float>(v2) * scale0;
+    output[j + 3] = static_cast<float>(v3) * scale0;
+  }
+  // Handle remaining elements (0-3)
+  if (j < col_size) {
+    uint8_t b = packed_data[idx];
+    int shift = 6;
+    for (; j < col_size; ++j, shift -= 2) {
+      int8_t v = static_cast<int8_t>(b << shift) >> 6;
+      output[j] = static_cast<float>(v) * scale0;
+    }
+  }
+}
 }  // namespace
 
 absl::Status HWPerLayerEmbeddingLookup(
@@ -1099,6 +1130,8 @@ absl::Status HWPerLayerEmbeddingLookup(
     row_size_bytes = ple_embedding_dim / 2;
   } else if (ple_table_element_type == litert::ElementType::Int8) {
     row_size_bytes = ple_embedding_dim;
+  } else if (ple_table_element_type == litert::ElementType::Int2) {
+    row_size_bytes = ple_embedding_dim / 4;
   } else {
     return absl::InvalidArgumentError(
         absl::StrCat("Unsupported table element type: ",
@@ -1134,6 +1167,8 @@ absl::Status HWPerLayerEmbeddingLookup(
         } else if (ple_table_element_type == litert::ElementType::Int8) {
           DequantizeInt8Row(reinterpret_cast<const int8_t*>(row_data), scale,
                             ple_embedding_dim, row_float.data());
+        } else if (ple_table_element_type == litert::ElementType::Int2) {
+          UnpackInt2Row(row_data, scale, ple_embedding_dim, row_float.data());
         }
         int16_t* int16_output = static_cast<int16_t*>(output_buffer) +
                                 t * num_tables * ple_embedding_dim +
@@ -1153,6 +1188,8 @@ absl::Status HWPerLayerEmbeddingLookup(
         } else if (ple_table_element_type == litert::ElementType::Int8) {
           DequantizeInt8Row(reinterpret_cast<const int8_t*>(row_data), scale,
                             ple_embedding_dim, float_output);
+        } else if (ple_table_element_type == litert::ElementType::Int2) {
+          UnpackInt2Row(row_data, scale, ple_embedding_dim, float_output);
         }
       } else {
         return absl::InvalidArgumentError(absl::StrCat(
